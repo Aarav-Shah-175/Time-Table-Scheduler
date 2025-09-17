@@ -24,7 +24,6 @@ app = FastAPI()
 jobs = {}
 
 def convert_to_serializable(obj):
-    """Convert datetime objects to ISO strings for JSON serialization"""
     if isinstance(obj, dict):
         return {k: convert_to_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -188,7 +187,6 @@ def time_slots_conflict(slot1, slot2):
 
 def fitness(schedule, data):
     conflicts = 0
-    # Existing conflicts (professor and classroom overlaps)
     for i in range(len(schedule)):
         for j in range(i + 1, len(schedule)):
             a, b = schedule[i], schedule[j]
@@ -197,7 +195,6 @@ def fitness(schedule, data):
             if a['classroom_id'] == b['classroom_id'] and time_slots_conflict(a, b):
                 conflicts += 10
 
-    # Student-course-day mapping
     student_course_days = {}
     enrollments = data['enrollments']
     student_courses = {}
@@ -205,7 +202,7 @@ def fitness(schedule, data):
         student_courses.setdefault(e['student_id'], []).append(e['course_id'])
 
     day_to_num = {'Monday': 1, 'Tuesday': 2, 'Wednesday': 3,
-                  'Thursday': 4, 'Friday': 5, 'Saturday': 6}
+                  'Thursday': 4, 'Friday': 5}
 
     for entry in schedule:
         course = entry['course_id']
@@ -228,7 +225,6 @@ def fitness(schedule, data):
                 if run_len >= 3:
                     conflicts += 5 * (run_len - 2)
 
-    # Teacher hour constraints
     prof_day_hours = {}
     for entry in schedule:
         key = (entry['professor_id'], entry['day'])
@@ -252,8 +248,7 @@ def generate_random_schedule(data):
     for course in data['courses']:
         prof = random.choice(data['professors'])
         room = random.choice(data['classrooms'])
-        # Default to 3 credits if not specified
-        credits = 3
+        credits = course.get('credits', 3) if 'credits' in course else 3
         for _ in range(credits):
             slot = random.choice(data['timetable_slots'])
             schedule.append({
@@ -301,10 +296,7 @@ def run_genetic_algorithm(data, population_size=50, generations=100):
     return best_schedule
 
 def persist_schedule(schedule, job_id, term='Fall 2025'):
-    # Convert schedule to serializable format first
     serializable_schedule = convert_to_serializable(schedule)
-    
-    # Create timetable version with ISO format datetime
     version_resp = supabase.table("timetable_versions").insert({
         "term": term,
         "generated_at": datetime.utcnow().isoformat(),
@@ -313,13 +305,11 @@ def persist_schedule(schedule, job_id, term='Fall 2025'):
 
     if not version_resp.data:
         raise Exception("Failed to create timetable version")
-    
+
     version_id = version_resp.data[0]["id"]
-    
-    # Clear existing schedule rows
+
     supabase.table("schedule_rows").delete().eq("timetable_version_id", version_id).execute()
-    
-    # Prepare bulk data for insertion
+
     bulk_data = []
     for row in serializable_schedule:
         bulk_data.append({
@@ -331,32 +321,28 @@ def persist_schedule(schedule, job_id, term='Fall 2025'):
             "start_time": row["start_time"],
             "end_time": row["end_time"],
         })
-    
-    # Insert schedule rows
+
     insert_resp = supabase.table("schedule_rows").insert(bulk_data).execute()
     if not insert_resp.data:
         raise Exception("Failed to insert schedule rows")
-    
-    # Create professor timetable entries
+
     professor_entries = {}
     for entry in bulk_data:
         prof = entry["professor_id"]
         if prof not in professor_entries:
             professor_entries[prof] = []
         professor_entries[prof].append(entry)
-    
-    # Create student timetable entries
+
     student_entries = {}
     enrollments = supabase.table("enrollments").select("*").execute().data
     student_courses = {}
     for e in enrollments:
         student_courses.setdefault(e["student_id"], []).append(e["course_id"])
-    
+
     for student_id, courses in student_courses.items():
         entries = [e for e in bulk_data if e["course_id"] in courses]
         student_entries[student_id] = entries
-    
-    # Insert professor timetable entries
+
     for prof_id, entries in professor_entries.items():
         supabase.table("timetable_entries").insert({
             "user_id": prof_id,
@@ -364,8 +350,7 @@ def persist_schedule(schedule, job_id, term='Fall 2025'):
             "timetable_version_id": version_id,
             "timetable": entries,
         }).execute()
-    
-    # Insert student timetable entries
+
     for student_id, entries in student_entries.items():
         supabase.table("timetable_entries").insert({
             "user_id": student_id,
@@ -373,23 +358,72 @@ def persist_schedule(schedule, job_id, term='Fall 2025'):
             "timetable_version_id": version_id,
             "timetable": entries,
         }).execute()
-    
-    # Send notifications
+
     notified_users = set(professor_entries.keys()) | set(student_entries.keys())
     for user_id in notified_users:
         supabase.table("notifications").insert({
             "user_id": user_id,
             "message": f"Your timetable for {term} has been updated.",
         }).execute()
-    
-    # Update job status
+
     supabase.table("generation_jobs").insert({
         "job_id": job_id,
         "job_status": "completed",
         "timetable_version_id": version_id,
     }).execute()
-    
+
     return version_id
+
+def transform_schedule(schedule, data):
+    courses_info = {c['id']: c for c in data['courses']}
+    classrooms_info = {c['id']: c['name'] for c in data['classrooms']}
+    professors_info = {p['id']: p['name'] for p in data['professors']}
+
+    output = {}
+    total_classes = 0
+    for entry in schedule:
+        day = entry['day']
+        start_time = entry['start_time']
+        end_time = entry['end_time']
+        course_id = entry['course_id']
+        classroom_id = entry['classroom_id']
+        professor_id = entry['professor_id']
+
+        course = courses_info.get(course_id, {})
+        course_code = course.get('code', '')
+        course_name = course.get('name', '')
+
+        if day not in output:
+            output[day] = []
+
+        time_slot_dict = next((ts for ts in output[day] if ts['time_slot']['start_time'] == start_time and ts['time_slot']['end_time'] == end_time), None)
+        if time_slot_dict is None:
+            time_slot_dict = {
+                'time_slot': {'start_time': start_time, 'end_time': end_time},
+                'courses': []
+            }
+            output[day].append(time_slot_dict)
+
+        course_group = next((c for c in time_slot_dict['courses'] if c['course_code'] == course_code), None)
+        if course_group is None:
+            course_group = {
+                'course_code': course_code,
+                'course_name': course_name,
+                'sections': []
+            }
+            time_slot_dict['courses'].append(course_group)
+
+        course_group['sections'].append({
+            'classroom': classrooms_info.get(classroom_id, ''),
+            'faculty': professors_info.get(professor_id, '')
+        })
+
+        total_classes += 1
+
+    return {
+        'schedule': output,
+        'summary': {'total_classes_scheduled': total_classes}
+    }
 
 @app.post("/generate-timetable")
 async def generate_timetable(term: str = "Fall 2025"):
@@ -398,20 +432,20 @@ async def generate_timetable(term: str = "Fall 2025"):
         schedule = run_genetic_algorithm(data)
         job_id = str(uuid.uuid4())
         jobs[job_id] = "running"
-        
+
         version_id = persist_schedule(schedule, job_id, term)
         jobs[job_id] = "completed"
 
-        # Ensure the final response is serializable
-        serializable_schedule = convert_to_serializable(schedule)
-        
+        transformed_schedule = transform_schedule(schedule, data)
+        serializable_schedule = convert_to_serializable(transformed_schedule)
+
         return {
             "job_id": job_id,
             "status": "completed",
             "timetable_version_id": version_id,
-            "schedule": serializable_schedule,
             "term": term,
-            "generated_at": datetime.utcnow().isoformat()
+            "generated_at": datetime.utcnow().isoformat(),
+            **serializable_schedule
         }
     except Exception as e:
         job_id = str(uuid.uuid4())
@@ -436,10 +470,10 @@ async def get_timetable(user_id: str, role: str, version_id: int = None):
         timetable_data = supabase.table("timetable_entries").select("*").eq("user_id", user_id).eq("role", role).eq("timetable_version_id", version_id).execute()
     else:
         timetable_data = supabase.table("timetable_entries").select("*").eq("user_id", user_id).eq("role", role).order("timetable_version_id", desc=True).limit(1).execute()
-    
+
     if not timetable_data.data:
         return {"user_id": user_id, "role": role, "timetable": [], "message": "No timetable found"}
-    
+
     return {
         "user_id": user_id,
         "role": role,
