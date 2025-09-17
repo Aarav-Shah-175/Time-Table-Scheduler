@@ -3,11 +3,13 @@ import csv
 import io
 import uuid
 from datetime import datetime, time, date
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import random
+from fastapi import Query
 
 load_dotenv()
 
@@ -23,6 +25,20 @@ app = FastAPI()
 
 jobs = {}
 
+origins = [
+    "http://localhost",
+    "http://localhost:3000", # The default URL for Next.js/React frontends
+    # Add the URL of your deployed V0 frontend here if you have one
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"], # Allows all headers
+)
+
 def convert_to_serializable(obj):
     if isinstance(obj, dict):
         return {k: convert_to_serializable(v) for k, v in obj.items()}
@@ -35,9 +51,69 @@ def convert_to_serializable(obj):
     else:
         return obj
 
-@app.get("/")
-async def root():
-    return {"message": "Welcome to Smart Timetable Scheduler API"}
+@app.get("/user-timetable")
+async def user_timetable(user_id: int, role: str):
+    # 1. Get latest timetable version
+    versions_resp = supabase.table("timetable_versions")\
+        .select("*").order("generated_at", desc=True).limit(1).execute()
+    if not versions_resp.data:
+        return {"error": "No timetable generated yet"}
+    latest_version_id = versions_resp.data[0]["id"]
+
+    # 2. Fetch timetable entries for this user
+    entries_resp = supabase.table("timetable_entries")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .eq("role", role)\
+        .eq("timetable_version_id", latest_version_id)\
+        .limit(1).execute()
+
+    if not entries_resp.data:
+        return {
+            "user_id": user_id,
+            "role": role,
+            "timetable": [],
+            "message": "No timetable entries found for this user"
+        }
+
+    timetable = entries_resp.data[0]["timetable"]
+
+    # 3. Fetch reference data to enrich timetable
+    ref_data = fetch_all_data()
+    courses_info = {c['id']: c for c in ref_data['courses']}
+    classrooms_info = {c['id']: c['name'] for c in ref_data['classrooms']}
+    professors_info = {p['id']: p['name'] for p in ref_data['professors']}
+
+    # 4. Enrich with names
+    for row in timetable:
+        row["course_name"] = courses_info.get(row["course_id"], {}).get("name", "")
+        row["course_code"] = courses_info.get(row["course_id"], {}).get("code", "")
+        row["classroom_name"] = classrooms_info.get(row["classroom_id"], "")
+        row["professor_name"] = professors_info.get(row["professor_id"], "")
+
+    # 5. Group by day + sort by start_time
+    day_order = {"Monday": 1, "Tuesday": 2, "Wednesday": 3,
+                 "Thursday": 4, "Friday": 5, "Saturday": 6}
+
+    grouped = {}
+    for row in timetable:
+        day = row["day"]
+        grouped.setdefault(day, []).append(row)
+
+    for day in grouped:
+        grouped[day].sort(key=lambda x: x["start_time"])
+    sorted_days = dict(sorted(grouped.items(), key=lambda x: day_order.get(x[0], 99)))
+
+    return {
+        "user_id": user_id,
+        "role": role,
+        "timetable_version_id": latest_version_id,
+        "timetable": sorted_days
+    }
+
+
+
+
 
 @app.post("/upload-csv")
 async def upload_csv(data_type: str, file: UploadFile = File(...)):
@@ -50,7 +126,7 @@ async def upload_csv(data_type: str, file: UploadFile = File(...)):
 
     content = await file.read()
     file_path = f"uploads/{datetime.utcnow().strftime('%Y%m%d_%H%M%S_')}{file.filename}"
-    
+
     try:
         supabase.storage.from_("uploads").upload(file_path, content)
     except Exception as e:
@@ -63,10 +139,10 @@ async def upload_csv(data_type: str, file: UploadFile = File(...)):
         file_stream = io.StringIO(content.decode("utf-8"))
         csv_reader = csv.DictReader(file_stream)
         rows = list(csv_reader)
-        
+
         if not rows:
             raise HTTPException(status_code=400, detail="CSV file is empty")
-        
+
         table_name = ""
         batch_data = []
 
@@ -76,49 +152,49 @@ async def upload_csv(data_type: str, file: UploadFile = File(...)):
                 raise HTTPException(status_code=400, detail=f"CSV for courses must contain columns: {required_cols}")
             table_name = "courses"
             batch_data = [{"id": int(row['id']), "name": row['name'], "code": row['code']} for row in rows]
-        
+
         elif data_type == "professors":
             required_cols = {"id", "name", "email"}
             if not required_cols.issubset(rows[0].keys()):
                 raise HTTPException(status_code=400, detail=f"CSV for professors must contain columns: {required_cols}")
             table_name = "professors"
             batch_data = [{"id": int(row['id']), "name": row['name'], "email": row['email']} for row in rows]
-        
+
         elif data_type == "students":
             required_cols = {"id", "name", "email"}
             if not required_cols.issubset(rows[0].keys()):
                 raise HTTPException(status_code=400, detail=f"CSV for students must contain columns: {required_cols}")
             table_name = "students"
             batch_data = [{"id": int(row['id']), "name": row['name'], "email": row['email']} for row in rows]
-        
+
         elif data_type == "enrollments":
             required_cols = {"student_id", "course_id"}
             if not required_cols.issubset(rows[0].keys()):
                 raise HTTPException(status_code=400, detail=f"CSV for enrollments must contain columns: {required_cols}")
             table_name = "enrollments"
             batch_data = [{"student_id": int(row['student_id']), "course_id": int(row['course_id'])} for row in rows]
-        
+
         elif data_type == "classrooms":
             required_cols = {"id", "name", "capacity"}
             if not required_cols.issubset(rows[0].keys()):
                 raise HTTPException(status_code=400, detail=f"CSV for classrooms must contain columns: {required_cols}")
             table_name = "classrooms"
             batch_data = [{"id": int(row['id']), "name": row['name'], "capacity": int(row['capacity'])} for row in rows]
-        
+
         elif data_type == "timetable_slots":
             required_cols = {"id", "day", "start_time", "end_time"}
             if not required_cols.issubset(rows[0].keys()):
                 raise HTTPException(status_code=400, detail=f"CSV for timetable_slots must contain columns: {required_cols}")
             table_name = "timetable_slots"
             batch_data = [{"id": int(row['id']), "day": row['day'], "start_time": row['start_time'], "end_time": row['end_time']} for row in rows]
-        
+
         elif data_type == "groups":
             required_cols = {"id", "name"}
             if not required_cols.issubset(rows[0].keys()):
                 raise HTTPException(status_code=400, detail=f"CSV for groups must contain columns: {required_cols}")
             table_name = "groups"
             batch_data = [{"id": int(row['id']), "name": row['name']} for row in rows]
-        
+
         else:
             raise HTTPException(status_code=400, detail=f"Data type {data_type} not implemented yet")
 
@@ -134,10 +210,10 @@ async def upload_csv(data_type: str, file: UploadFile = File(...)):
     try:
         result = supabase.table(table_name).upsert(batch_data, on_conflict='id').execute()
         inserted_count = len(result.data) if result.data else len(batch_data)
-        
+
         supabase.table("import_audit").insert({
             "filename": file.filename,
-            "status": "success", 
+            "status": "success",
             "message": f"Upserted {inserted_count} records into {table_name}",
             "records_processed": len(batch_data),
             "records_inserted": inserted_count
@@ -147,7 +223,7 @@ async def upload_csv(data_type: str, file: UploadFile = File(...)):
         error_message = str(e)
         supabase.table("import_audit").insert({
             "filename": file.filename,
-            "status": "failed", 
+            "status": "failed",
             "message": error_message,
             "records_processed": len(batch_data),
             "records_inserted": 0
@@ -155,11 +231,12 @@ async def upload_csv(data_type: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Database operation failed: {error_message}")
 
     return JSONResponse({
-        "message": f"Uploaded and upserted {len(batch_data)} rows into {table_name}", 
+        "message": f"Uploaded and upserted {len(batch_data)} rows into {table_name}",
         "storage_path": file_path,
         "records_processed": len(batch_data),
         "records_inserted": inserted_count
     })
+
 
 def fetch_all_data():
     courses = supabase.table("courses").select("*").execute().data
@@ -180,68 +257,65 @@ def fetch_all_data():
         "enrollments": enrollments,
     }
 
+
 def time_slots_conflict(slot1, slot2):
     if slot1['day'] != slot2['day']:
         return False
     return max(slot1['start_time'], slot2['start_time']) < min(slot1['end_time'], slot2['end_time'])
 
+
 def fitness(schedule, data):
     conflicts = 0
+
+    # Conflict: professors or classrooms overlap
     for i in range(len(schedule)):
         for j in range(i + 1, len(schedule)):
             a, b = schedule[i], schedule[j]
             if a['professor_id'] == b['professor_id'] and time_slots_conflict(a, b):
-                conflicts += 10
+                conflicts += 50
             if a['classroom_id'] == b['classroom_id'] and time_slots_conflict(a, b):
-                conflicts += 10
+                conflicts += 50
 
-    student_course_days = {}
+    # Build student course mapping
     enrollments = data['enrollments']
     student_courses = {}
     for e in enrollments:
         student_courses.setdefault(e['student_id'], []).append(e['course_id'])
 
-    day_to_num = {'Monday': 1, 'Tuesday': 2, 'Wednesday': 3,
-                  'Thursday': 4, 'Friday': 5}
-
+    # Student constraint: no same subject twice a day
     for entry in schedule:
         course = entry['course_id']
         day = entry['day']
         for student_id, courses in student_courses.items():
             if course in courses:
-                student_course_days.setdefault((student_id, course), set()).add(day_to_num[day])
+                key = (student_id, course, day)
+                # Count how many times this student has the same course on same day
+                occurrences = sum(
+                    1 for e in schedule if e['course_id'] == course and e['day'] == day
+                )
+                if occurrences > 1:
+                    conflicts += 30 * (occurrences - 1)
 
-    for (student_id, course_id), days in student_course_days.items():
-        days_list = sorted(days)
-        for i in range(1, len(days_list)):
-            if days_list[i] == days_list[i-1]:
-                conflicts += 5
-            if days_list[i] == days_list[i-1] + 1:
-                run_len = 2
-                idx = i + 1
-                while idx < len(days_list) and days_list[idx] == days_list[idx-1] + 1:
-                    run_len += 1
-                    idx += 1
-                if run_len >= 3:
-                    conflicts += 5 * (run_len - 2)
-
+    # Professor load distribution
     prof_day_hours = {}
+    prof_week_hours = {}
+
     for entry in schedule:
         key = (entry['professor_id'], entry['day'])
         prof_day_hours[key] = prof_day_hours.get(key, 0) + 1
+        prof_week_hours[entry['professor_id']] = prof_week_hours.get(entry['professor_id'], 0) + 1
 
-    prof_week_hours = {}
     for (prof, day), hours in prof_day_hours.items():
-        if hours > 8:
-            conflicts += (hours - 8) * 10
-        prof_week_hours[prof] = prof_week_hours.get(prof, 0) + hours
+        if hours > 5:  # more than 5 hours in a single day
+            conflicts += (hours - 5) * 20
 
     for prof, total_hours in prof_week_hours.items():
         diff = abs(20 - total_hours)
-        if diff > 5:
-            conflicts += diff * 2
+        conflicts += diff * 5
 
     return conflicts
+
+
 
 def generate_random_schedule(data):
     schedule = []
@@ -260,6 +334,7 @@ def generate_random_schedule(data):
                 'end_time': slot['end_time']
             })
     return schedule
+
 
 def run_genetic_algorithm(data, population_size=50, generations=100):
     population = [generate_random_schedule(data) for _ in range(population_size)]
@@ -295,8 +370,10 @@ def run_genetic_algorithm(data, population_size=50, generations=100):
         population = new_population
     return best_schedule
 
+
 def persist_schedule(schedule, job_id, term='Fall 2025'):
     serializable_schedule = convert_to_serializable(schedule)
+
     version_resp = supabase.table("timetable_versions").insert({
         "term": term,
         "generated_at": datetime.utcnow().isoformat(),
@@ -333,15 +410,16 @@ def persist_schedule(schedule, job_id, term='Fall 2025'):
             professor_entries[prof] = []
         professor_entries[prof].append(entry)
 
-    student_entries = {}
     enrollments = supabase.table("enrollments").select("*").execute().data
     student_courses = {}
     for e in enrollments:
         student_courses.setdefault(e["student_id"], []).append(e["course_id"])
 
+    student_entries = {}
     for student_id, courses in student_courses.items():
         entries = [e for e in bulk_data if e["course_id"] in courses]
-        student_entries[student_id] = entries
+        if entries:
+            student_entries[student_id] = entries
 
     for prof_id, entries in professor_entries.items():
         supabase.table("timetable_entries").insert({
@@ -374,59 +452,30 @@ def persist_schedule(schedule, job_id, term='Fall 2025'):
 
     return version_id
 
-def transform_schedule(schedule, data):
-    courses_info = {c['id']: c for c in data['courses']}
-    classrooms_info = {c['id']: c['name'] for c in data['classrooms']}
-    professors_info = {p['id']: p['name'] for p in data['professors']}
-
-    output = {}
-    total_classes = 0
-    for entry in schedule:
-        day = entry['day']
-        start_time = entry['start_time']
-        end_time = entry['end_time']
-        course_id = entry['course_id']
-        classroom_id = entry['classroom_id']
-        professor_id = entry['professor_id']
-
-        course = courses_info.get(course_id, {})
-        course_code = course.get('code', '')
-        course_name = course.get('name', '')
-
-        if day not in output:
-            output[day] = []
-
-        time_slot_dict = next((ts for ts in output[day] if ts['time_slot']['start_time'] == start_time and ts['time_slot']['end_time'] == end_time), None)
-        if time_slot_dict is None:
-            time_slot_dict = {
-                'time_slot': {'start_time': start_time, 'end_time': end_time},
-                'courses': []
-            }
-            output[day].append(time_slot_dict)
-
-        course_group = next((c for c in time_slot_dict['courses'] if c['course_code'] == course_code), None)
-        if course_group is None:
-            course_group = {
-                'course_code': course_code,
-                'course_name': course_name,
-                'sections': []
-            }
-            time_slot_dict['courses'].append(course_group)
-
-        course_group['sections'].append({
-            'classroom': classrooms_info.get(classroom_id, ''),
-            'faculty': professors_info.get(professor_id, '')
-        })
-
-        total_classes += 1
-
-    return {
-        'schedule': output,
-        'summary': {'total_classes_scheduled': total_classes}
-    }
 
 @app.post("/generate-timetable")
-async def generate_timetable(term: str = "Fall 2025"):
+async def generate_timetable(term: str = Query("Fall 2025"), force_regenerate: bool = Query(False)):
+    # Check if timetable for term already exists
+    existing_versions = supabase.table("timetable_versions").select("*").eq("term", term).order("generated_at", desc=True).limit(1).execute()
+    if existing_versions.data and not force_regenerate:
+        version = existing_versions.data[0]
+        version_id = version["id"]
+        job_id = version["job_id"]
+        # Fetch transformed schedule from schedule_rows
+        schedule_rows = supabase.table("schedule_rows").select("*").eq("timetable_version_id", version_id).execute().data
+        ref_data = fetch_all_data()
+        transformed_schedule = transform_schedule(schedule_rows, ref_data)
+
+        return {
+            "job_id": job_id,
+            "status": "cached",
+            "timetable_version_id": version_id,
+            "term": term,
+            "generated_at": version["generated_at"],
+            **transformed_schedule
+        }
+
+    # Otherwise generate new timetable and persist
     try:
         data = fetch_all_data()
         schedule = run_genetic_algorithm(data)
@@ -452,6 +501,8 @@ async def generate_timetable(term: str = "Fall 2025"):
         jobs[job_id] = "failed"
         return {"job_id": job_id, "status": "failed", "error": str(e)}
 
+
+
 @app.get("/job/{job_id}")
 async def get_job_status(job_id: str):
     status = jobs.get(job_id)
@@ -464,24 +515,122 @@ async def get_job_status(job_id: str):
             raise HTTPException(status_code=404, detail="Job not found")
     return {"job_id": job_id, "status": status}
 
+
 @app.get("/timetable")
 async def get_timetable(user_id: str, role: str, version_id: int = None):
-    if version_id:
-        timetable_data = supabase.table("timetable_entries").select("*").eq("user_id", user_id).eq("role", role).eq("timetable_version_id", version_id).execute()
-    else:
-        timetable_data = supabase.table("timetable_entries").select("*").eq("user_id", user_id).eq("role", role).order("timetable_version_id", desc=True).limit(1).execute()
+    # For students, get courses they are enrolled in
+    if role == "student":
+        enrollments = supabase.table("enrollments").select("course_id").eq("student_id", user_id).execute().data
+        enrolled_courses = list(set(e['course_id'] for e in enrollments)) if enrollments else []
+        if not enrolled_courses:
+            return {"user_id": user_id, "role": role, "timetable": {}, "message": "No enrolled courses found"}
 
-    if not timetable_data.data:
-        return {"user_id": user_id, "role": role, "timetable": [], "message": "No timetable found"}
+        query = supabase.table("schedule_rows").select("*").in_("course_id", enrolled_courses)
+        if version_id:
+            query = query.eq("timetable_version_id", version_id)
+
+        schedule_data = query.execute().data or []
+
+    # For teachers, get schedule rows assigned
+    elif role == "professor" or role == "teacher":
+        query = supabase.table("schedule_rows").select("*").eq("professor_id", user_id)
+        if version_id:
+            query = query.eq("timetable_version_id", version_id)
+
+        schedule_data = query.execute().data or []
+
+    # For admin or others, optionally return full schedule or error
+    else:
+        return {"error": f"Role '{role}' not supported for timetable"}
+
+    # Fetch reference data to enhance the timetable display
+    ref_data = fetch_all_data()
+    transformed_schedule = transform_schedule(schedule_data, ref_data)
 
     return {
         "user_id": user_id,
         "role": role,
-        "timetable": timetable_data.data[0]["timetable"],
-        "version_id": timetable_data.data[0]["timetable_version_id"]
+        "timetable": transformed_schedule['schedule'],
+        "summary": transformed_schedule['summary']
     }
+
+
 
 @app.get("/timetable-versions")
 async def get_timetable_versions():
     versions = supabase.table("timetable_versions").select("*").order("generated_at", desc=True).execute()
     return {"versions": convert_to_serializable(versions.data)}
+
+
+def transform_schedule(schedule, data):
+    courses_info = {c['id']: c for c in data['courses']}
+    classrooms_info = {c['id']: c['name'] for c in data['classrooms']}
+    professors_info = {p['id']: p['name'] for p in data['professors']}
+
+    output = {}
+    total_classes = 0
+
+    # Define day order for sorting
+    day_order = {"Monday": 1, "Tuesday": 2, "Wednesday": 3,
+                 "Thursday": 4, "Friday": 5, "Saturday": 6}
+
+    for entry in schedule:
+        day = entry['day']
+        start_time = entry['start_time']
+        end_time = entry['end_time']
+        course_id = entry['course_id']
+        classroom_id = entry['classroom_id']
+        professor_id = entry['professor_id']
+
+        course = courses_info.get(course_id, {})
+        course_code = course.get('code', '')
+        course_name = course.get('name', '')
+
+        if day not in output:
+            output[day] = []
+
+        # Find or create time slot
+        time_slot_dict = next(
+            (ts for ts in output[day]
+             if ts['time_slot']['start_time'] == start_time
+             and ts['time_slot']['end_time'] == end_time),
+            None
+        )
+        if time_slot_dict is None:
+            time_slot_dict = {
+                'time_slot': {'start_time': start_time, 'end_time': end_time},
+                'courses': []
+            }
+            output[day].append(time_slot_dict)
+
+        # Find or create course entry
+        course_group = next(
+            (c for c in time_slot_dict['courses'] if c['course_code'] == course_code),
+            None
+        )
+        if course_group is None:
+            course_group = {
+                'course_code': course_code,
+                'course_name': course_name,
+                'sections': []
+            }
+            time_slot_dict['courses'].append(course_group)
+
+        # Append classroom + professor info
+        course_group['sections'].append({
+            'classroom': classrooms_info.get(classroom_id, ''),
+            'faculty': professors_info.get(professor_id, '')
+        })
+
+        total_classes += 1
+
+    # ✅ Sort days and time slots
+    sorted_output = dict(sorted(output.items(), key=lambda x: day_order.get(x[0], 99)))
+    for day in sorted_output:
+        sorted_output[day].sort(key=lambda ts: ts['time_slot']['start_time'])
+
+    return {
+        'schedule': sorted_output,
+        'summary': {'total_classes_scheduled': total_classes}
+    }
+
